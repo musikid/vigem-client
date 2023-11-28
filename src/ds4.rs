@@ -1,125 +1,162 @@
-use std::{fmt, mem, ptr};
-use std::borrow::Borrow;
 use crate::*;
+use std::borrow::Borrow;
+use std::{marker, pin, thread};
+use std::{fmt, mem, ptr};
 
-/// DualShock4 HID Input report.
-#[cfg(feature = "unstable_ds4")]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-#[repr(C)]
-pub struct DS4Report {
-	pub thumb_lx: u8,
-	pub thumb_ly: u8,
-	pub thumb_rx: u8,
-	pub thumb_ry: u8,
-	pub buttons: u16,
-	pub special: u8,
-	pub trigger_l: u8,
-	pub trigger_r: u8,
+mod button;
+mod reports;
+
+use winapi::shared::winerror;
+
+pub use button::*;
+pub use reports::*;
+
+pub struct DSRequestNotification {
+	client: Client,
+	ds4rn: bus::RequestNotification,
+	_unpin: marker::PhantomPinned,
 }
-#[cfg(feature = "unstable_ds4")]
-impl Default for DS4Report {
+
+
+impl DSRequestNotification {
+	/// Returns if the underlying target is still attached.
 	#[inline]
-	fn default() -> Self {
-		DS4Report {
-			thumb_lx: 0x80,
-			thumb_ly: 0x80,
-			thumb_rx: 0x80,
-			thumb_ry: 0x80,
-			buttons: 0x8,
-			special: 0,
-			trigger_l: 0,
-			trigger_r: 0,
+	pub fn is_attached(&self) -> bool {
+		match self.ds4rn.buffer {
+			bus::RequestNotificationVariant::DS4(ref buffer) => buffer.SerialNo != 0,
+			#[allow(unreachable_patterns)]
+			_ => unreachable!()
+		}
+	}
+
+	/// Spawns a thread to handle the notifications.
+	///
+	/// The callback `f` is invoked for every notification.
+	///
+	/// Returns a [`JoinHandle`](thread::JoinHandle) for the created thread.
+	/// It is recommended to join the thread after the target from which the notifications are requested is dropped.
+	#[inline]
+	pub fn spawn_thread<F: FnMut(&DSRequestNotification, bus::DS4OutputReport) + Send + 'static>(self, mut f: F) -> thread::JoinHandle<()> {
+		thread::spawn(move || {
+			// Safety: the request notification object is not accessible after it is pinned
+			let mut reqn = self;
+			let mut reqn = unsafe { pin::Pin::new_unchecked(&mut reqn) };
+			loop {
+				reqn.as_mut().request();
+				let result = reqn.as_mut().poll(true);
+				match result {
+					Ok(None) => {},
+					Ok(Some(data)) => f(&reqn, data),
+					// When the target is dropped the notification request is aborted
+					Err(_) => break,
+				}
+			}
+		})
+	}
+
+	/// Requests a notification.
+	#[inline(never)]
+	pub fn request(self: pin::Pin<&mut Self>) {
+		unsafe {
+			let device = self.client.device;
+			let ds4rn = &mut self.get_unchecked_mut().ds4rn;
+			match ds4rn.buffer {
+				bus::RequestNotificationVariant::DS4(ref mut buffer) => {
+					if buffer.SerialNo != 0 {
+						ds4rn.ioctl(device);
+					}
+				},
+				#[allow(unreachable_patterns)]
+				_ => unreachable!()
+			}
+		}
+	}
+
+	/// Polls the request for notifications.
+	///
+	/// If `wait` is true this method will block until a notification is received.
+	/// Else returns immediately if no notification is received yet.
+	///
+	/// Returns:
+	///
+	/// * `Ok(None)`: When `wait` is false and there is no notification yet.
+	/// * `Ok(Some(_))`: The notification was successfully received.  
+	///   Another request should be made or any other calls to `poll` return the same result.
+	/// * `Err(OperationAborted)`: The underlying target was unplugged causing any pending notification requests to abort.
+	/// * `Err(_)`: An unexpected error occurred.
+	#[inline(never)]
+	pub fn poll(self: pin::Pin<&mut Self>, wait: bool) -> Result<Option<bus::DS4OutputReport>, Error> {
+		unsafe {
+			let device = self.client.device;
+			let ds4rn = &mut self.get_unchecked_mut().ds4rn;
+			match ds4rn.poll(device, wait) {
+				Ok(()) => {
+					match &ds4rn.buffer {
+						bus::RequestNotificationVariant::DS4(buffer) => {
+							Ok(Some(bus::DS4OutputReport {
+								small_motor: buffer.Report.small_motor,
+								large_motor: buffer.Report.large_motor,
+								lightbar_color: buffer.Report.lightbar_color,
+							}))
+						},
+						#[allow(unreachable_patterns)]
+						_ => unreachable!()
+					}
+				},
+				Err(winerror::ERROR_IO_INCOMPLETE) => Ok(None),
+				Err(winerror::ERROR_OPERATION_ABORTED) => {
+					// Operation was aborted, fail all future calls
+					// The is aborted when the underlying target is unplugged
+					// This has the potential for a race condition:
+					//  What happens if a new target is plugged inbetween calls to poll and request...
+					match ds4rn.buffer {
+						bus::RequestNotificationVariant::DS4(ref mut buffer) => { buffer.SerialNo = 0; },
+						#[allow(unreachable_patterns)]
+						_ => unreachable!()
+					}
+					Err(Error::OperationAborted)
+				},
+				Err(err) => Err(Error::WinError(err)),
+			}
+		}
+	}
+}
+unsafe impl Sync for DSRequestNotification {}
+unsafe impl Send for DSRequestNotification {}
+
+impl fmt::Debug for DSRequestNotification {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let buffer = match &self.ds4rn.buffer {
+			bus::RequestNotificationVariant::DS4(buffer) => buffer,
+			#[allow(unreachable_patterns)]
+			_ => unreachable!()
+		};
+		f.debug_struct("DSRequestNotification")
+			.field("client", &format_args!("{:?}", self.client))
+			.field("serial_no", &buffer.SerialNo)
+			.finish()
+	}
+}
+
+
+impl Drop for DSRequestNotification {
+	fn drop(&mut self) {
+		unsafe {
+			let this = pin::Pin::new_unchecked(self);
+			let serial_no = match &this.ds4rn.buffer {
+				bus::RequestNotificationVariant::DS4(buffer) => buffer.SerialNo,
+				#[allow(unreachable_patterns)]
+				_ => unreachable!()
+			};
+			if serial_no != 0 {
+				let device = this.client.device;
+				let ds4rn = &mut this.get_unchecked_mut().ds4rn;
+				let _ = ds4rn.cancel(device);
+			}
 		}
 	}
 }
 
-#[cfg(feature = "unstable_ds4")]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(C)]
-pub struct DS4Touch {
-    pub packet_counter: u8, // timestamp / packet counter associated with touch event
-    pub is_up_tracking_num1: u8, // 0 means down; active low
-    // unique to each finger down, so for a lift and repress the value is incremented
-    pub touch_data_1: [u8; 3], // Two 12 bits values (for X and Y)
-    // middle byte holds last 4 bits of X and the starting 4 bits of Y
-    pub is_up_tracking_num2: u8, // second touch data immediately follows data of first touch
-    pub touch_data_2: [u8; 3],   // resolution is 1920x943
-}
-
-/// DualShock4 v1 complete HID Input report.
-#[cfg(feature = "unstable_ds4")]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(C, packed)]
-pub struct DS4ReportEx {
-    pub thumb_lx: u8,
-    pub thumb_ly: u8,
-    pub thumb_rx: u8,
-    pub thumb_ry: u8,
-    pub buttons: u16,
-    pub special: u8,
-    pub trigger_l: u8,
-    pub trigger_r: u8,
-    pub timestamp: u16,
-    pub battery_lvl: u8,
-    pub gyro_x: i16,
-    pub gyro_y: i16,
-    pub gyro_z: i16,
-    pub accel_x: i16,
-    pub accel_y: i16,
-    pub accel_z: i16,
-    pub _unknown1: [u8; 5],
-    pub battery_lvl_special: u8,
-    pub _unknown2: [u8; 2],
-    pub touch_packets_n: u8, // 0x00 to 0x03 (USB max)
-    pub current_touch: DS4Touch,
-    pub previous_touch: [DS4Touch; 2],
-    pub _end_padding: [u8; 3], /* This struct is normally used as an union member with another member of 63 bytes,
-                        we bypass this by setting directly the padding in the struct */
-}
-
-#[cfg(feature = "unstable_ds4")]
-impl Default for DS4ReportEx {
-    #[inline]
-    fn default() -> Self {
-        DS4ReportEx {
-            thumb_lx: 0x80,
-            thumb_ly: 0x80,
-            thumb_rx: 0x80,
-            thumb_ry: 0x80,
-            buttons: 0x8,
-            special: 0,
-            trigger_l: 0,
-            trigger_r: 0,
-            timestamp: 0,
-            battery_lvl: 0,
-            gyro_x: 0,
-            gyro_y: 0,
-            gyro_z: 0,
-            accel_x: 0,
-            accel_y: 0,
-            accel_z: 0,
-            _unknown1: [0; 5],
-            battery_lvl_special: 0,
-            _unknown2: [0; 2],
-            touch_packets_n: 0,
-            current_touch: DS4Touch {
-                packet_counter: 0,
-                is_up_tracking_num1: 0,
-                touch_data_1: [0; 3],
-                is_up_tracking_num2: 0,
-                touch_data_2: [0; 3],
-            },
-            previous_touch: [DS4Touch {
-                packet_counter: 0,
-                is_up_tracking_num1: 0,
-                touch_data_1: [0; 3],
-                is_up_tracking_num2: 0,
-                touch_data_2: [0; 3],
-            }; 2],
-            _end_padding: [0; 3],
-        }
-    }
-}
 
 /// A virtual Sony DualShock 4 (wired).
 pub struct DualShock4Wired<CL: Borrow<Client>> {
@@ -134,7 +171,12 @@ impl<CL: Borrow<Client>> DualShock4Wired<CL> {
 	#[inline]
 	pub fn new(client: CL, id: TargetId) -> DualShock4Wired<CL> {
 		let event = Event::new(false, false);
-		DualShock4Wired { client, event, serial_no: 0, id }
+		DualShock4Wired {
+			client,
+			event,
+			serial_no: 0,
+			id,
+		}
 	}
 
 	/// Returns if the controller is plugged in.
@@ -229,7 +271,6 @@ impl<CL: Borrow<Client>> DualShock4Wired<CL> {
 	}
 
 	/// Updates the virtual controller state.
-	#[cfg(feature = "unstable_ds4")]
 	#[inline(never)]
 	pub fn update(&mut self, report: &DS4Report) -> Result<(), Error> {
 		if !self.is_attached() {
@@ -245,21 +286,39 @@ impl<CL: Borrow<Client>> DualShock4Wired<CL> {
 		Ok(())
 	}
 
-    #[inline(never)]
-    #[cfg(feature = "unstable_ds4")]
-    pub fn update_ex(&mut self, report: &DS4ReportEx) -> Result<(), Error> {
-        if !self.is_attached() {
-            return Err(Error::NotPluggedIn);
-        }
+	/// Updates the virtual controller state using the extended report.
+	#[inline(never)]
+	pub fn update_ex(&mut self, report: &DS4ReportEx) -> Result<(), Error> {
+		if !self.is_attached() {
+			return Err(Error::NotPluggedIn);
+		}
 
-        unsafe {
-            let mut dsr = bus::DS4SubmitReportEx::new(self.serial_no, *report);
-            let device = self.client.borrow().device;
-            dsr.ioctl(device, self.event.handle)?;
-        }
+		unsafe {
+			let mut dsr = bus::DS4SubmitReportEx::new(self.serial_no, *report);
+			let device = self.client.borrow().device;
+			dsr.ioctl(device, self.event.handle)?;
+		}
 
-        Ok(())
-    }
+		Ok(())
+	}
+
+	/// Request notification.
+	///
+	/// See examples/notification.rs for a complete example how to use this interface.
+	///
+	/// Do not create more than one request notification per target.
+	/// Notifications may get lost or received by one or more listeners.
+	#[inline(never)]
+	pub fn request_notification(&mut self) -> Result<DSRequestNotification, Error> {
+		if !self.is_attached() {
+			return Err(Error::NotPluggedIn);
+		}
+
+		let client = self.client.borrow().try_clone()?;
+		let ds4rn = bus::RequestNotification::new(bus::RequestNotificationVariant::DS4(bus::DS4RequestNotification::new(self.serial_no)));
+
+		Ok(DSRequestNotification { client, ds4rn, _unpin: marker::PhantomPinned })
+	}
 }
 
 impl<CL: Borrow<Client>> fmt::Debug for DualShock4Wired<CL> {

@@ -51,7 +51,7 @@ macro_rules! XButtons {
 
 impl XButtons {
 	/// Dpad up button.
-	pub const UP: u16     = 0x0001;
+	pub const UP: u16	 = 0x0001;
 	/// Dpad down button.
 	pub const DOWN: u16   = 0x0002;
 	/// Dpad left button.
@@ -67,19 +67,19 @@ impl XButtons {
 	/// Right thumb button.
 	pub const RTHUMB: u16 = 0x0080;
 	/// Left shoulder button.
-	pub const LB: u16     = 0x0100;
+	pub const LB: u16	 = 0x0100;
 	/// Right shoulder button.
-	pub const RB: u16     = 0x0200;
+	pub const RB: u16	 = 0x0200;
 	/// Xbox guide button.
 	pub const GUIDE: u16  = 0x0400;
 	/// A button.
-	pub const A: u16      = 0x1000;
+	pub const A: u16	  = 0x1000;
 	/// B button.
-	pub const B: u16      = 0x2000;
+	pub const B: u16	  = 0x2000;
 	/// X button.
-	pub const X: u16      = 0x4000;
+	pub const X: u16	  = 0x4000;
 	/// Y button.
-	pub const Y: u16      = 0x8000;
+	pub const Y: u16	  = 0x8000;
 }
 
 impl From<u16> for XButtons {
@@ -110,13 +110,14 @@ impl AsMut<u16> for XButtons {
 impl fmt::Debug for XButtons {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		if f.alternate() {
-			const NAMES: [&'static str; 16] = [
+			const NAMES: [&str; 16] = [
 				"UP", "DOWN", "LEFT", "RIGHT",
 				"START", "BACK", "LTHUMB", "RTHUMB",
 				"LB", "RB", "GUIDE", "?",
 				"A", "B", "X", "Y",
 			];
 			let mut comma = false;
+			#[allow(clippy::needless_range_loop)]
 			for index in 0..16 {
 				if self.raw & (1 << index) != 0 {
 					if comma {
@@ -190,7 +191,7 @@ pub struct XNotification {
 #[cfg(feature = "unstable_xtarget_notification")]
 pub struct XRequestNotification {
 	client: Client,
-	xurn: bus::RequestNotification<bus::XUsbRequestNotification>,
+	xurn: bus::RequestNotification,
 	_unpin: marker::PhantomPinned,
 }
 
@@ -199,7 +200,11 @@ impl XRequestNotification {
 	/// Returns if the underlying target is still attached.
 	#[inline]
 	pub fn is_attached(&self) -> bool {
-		self.xurn.buffer.SerialNo != 0
+		match self.xurn.buffer {
+			bus::RequestNotificationVariant::XUsb(ref buffer) => buffer.SerialNo != 0,
+			#[allow(unreachable_patterns)]
+			_ => unreachable!()
+		}
 	}
 
 	/// Spawns a thread to handle the notifications.
@@ -233,8 +238,14 @@ impl XRequestNotification {
 		unsafe {
 			let device = self.client.device;
 			let xurn = &mut self.get_unchecked_mut().xurn;
-			if xurn.buffer.SerialNo != 0 {
-				xurn.ioctl(device);
+			match xurn.buffer {
+				bus::RequestNotificationVariant::XUsb(ref mut buffer) => {
+					if buffer.SerialNo != 0 {
+						xurn.ioctl(device);
+					}
+				},
+				#[allow(unreachable_patterns)]
+				_ => unreachable!()
 			}
 		}
 	}
@@ -257,18 +268,30 @@ impl XRequestNotification {
 			let device = self.client.device;
 			let xurn = &mut self.get_unchecked_mut().xurn;
 			match xurn.poll(device, wait) {
-				Ok(()) => Ok(Some(XNotification {
-					large_motor: xurn.buffer.LargeMotor,
-					small_motor: xurn.buffer.SmallMotor,
-					led_number: xurn.buffer.LedNumber,
-				})),
+				Ok(()) => {
+					match &xurn.buffer {
+						bus::RequestNotificationVariant::XUsb(buffer) => {
+							Ok(Some(XNotification {
+								large_motor: buffer.LargeMotor,
+								small_motor: buffer.SmallMotor,
+								led_number: buffer.LedNumber,
+							}))
+						},
+						#[allow(unreachable_patterns)]
+						_ => unreachable!()
+					}
+				}
 				Err(winerror::ERROR_IO_INCOMPLETE) => Ok(None),
 				Err(winerror::ERROR_OPERATION_ABORTED) => {
 					// Operation was aborted, fail all future calls
 					// The is aborted when the underlying target is unplugged
 					// This has the potential for a race condition:
 					//  What happens if a new target is plugged inbetween calls to poll and request...
-					xurn.buffer.SerialNo = 0;
+					match xurn.buffer {
+						bus::RequestNotificationVariant::XUsb(ref mut buffer) => { buffer.SerialNo = 0; },
+						#[allow(unreachable_patterns)]
+						_ => unreachable!()
+					}
 					Err(Error::OperationAborted)
 				},
 				Err(err) => Err(Error::WinError(err)),
@@ -285,9 +308,14 @@ unsafe impl Send for XRequestNotification {}
 #[cfg(feature = "unstable_xtarget_notification")]
 impl fmt::Debug for XRequestNotification {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let buffer = match &self.xurn.buffer {
+			bus::RequestNotificationVariant::XUsb(buffer) => buffer,
+			#[allow(unreachable_patterns)]
+			_ => unreachable!()
+		};
 		f.debug_struct("XRequestNotification")
 			.field("client", &format_args!("{:?}", self.client))
-			.field("serial_no", &self.xurn.buffer.SerialNo)
+			.field("serial_no", &buffer.SerialNo)
 			.finish()
 	}
 }
@@ -297,7 +325,12 @@ impl Drop for XRequestNotification {
 	fn drop(&mut self) {
 		unsafe {
 			let this = pin::Pin::new_unchecked(self);
-			if this.xurn.buffer.SerialNo != 0 {
+			let serial_no = match &this.xurn.buffer {
+				bus::RequestNotificationVariant::XUsb(buffer) => buffer.SerialNo,
+				#[allow(unreachable_patterns)]
+				_ => unreachable!()
+			};
+			if serial_no != 0 {
 				let device = this.client.device;
 				let xurn = &mut this.get_unchecked_mut().xurn;
 				let _ = xurn.cancel(device);
@@ -468,8 +501,7 @@ impl<CL: Borrow<Client>> Xbox360Wired<CL> {
 		}
 
 		let client = self.client.borrow().try_clone()?;
-		let xurn = bus::RequestNotification::new(
-			bus::XUsbRequestNotification::new(self.serial_no));
+		let xurn = bus::RequestNotification::new(bus::RequestNotificationVariant::XUsb(bus::XUsbRequestNotification::new(self.serial_no)));
 
 		Ok(XRequestNotification { client, xurn, _unpin: marker::PhantomPinned })
 	}

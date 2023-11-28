@@ -24,9 +24,10 @@ pub const IOCTL_WAIT_DEVICE_READY: u32 = 0x2AA010; //IOCTL_BASE + 0x003;
 #[cfg(feature = "unstable_xtarget_notification")]
 pub const IOCTL_XUSB_REQUEST_NOTIFICATION : u32 = 0x2AE804; //IOCTL_BASE + 0x200 (RW);
 pub const IOCTL_XUSB_SUBMIT_REPORT: u32 = 0x2AA808; //IOCTL_BASE + 0x201;
-#[cfg(feature = "unstable_ds4")]
 pub const IOCTL_DS4_SUBMIT_REPORT: u32 = 0x2AA80C; //IOCTL_BASE + 0x202;
-pub const IOCTL_XUSB_GET_USER_INDEX: u32 = 0x2AE81C; //IOCTL_BASE + 0x206;
+pub const IOCTL_DS4_REQUEST_NOTIFICATION: u32 = 0x2AA810; //IOCTL_BASE + 0x203;
+pub const IOCTL_XUSB_GET_USER_INDEX: u32 = 0x2AE81C; //IOCTL_BASE + 0x206 (RW);
+// pub const IOCTL_DS4_AWAIT_OUTPUT_AVAILABLE: u32 = 0x2AE820; //IOCTL_BASE + 0x207 (RW);
 
 #[repr(C)]
 pub struct CheckVersion {
@@ -60,7 +61,7 @@ impl CheckVersion {
 
 		let success = GetOverlappedResult(device, &mut overlapped, &mut transferred, /*bWait: */1);
 		CloseHandle(overlapped.hEvent);
-		return success != 0;
+		success != 0
 	}
 }
 
@@ -259,18 +260,57 @@ impl XUsbRequestNotification {
 	}
 }
 
-#[cfg(feature = "unstable_xtarget_notification")]
+#[derive(Debug, Default)]
 #[repr(C)]
-pub struct RequestNotification<T> {
+pub struct DS4OutputReport {
+	pub small_motor: u8,
+	pub large_motor: u8,
+	pub lightbar_color: DS4LightbarColor,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct DS4LightbarColor {
+	pub r: u8,
+	pub g: u8,
+	pub b: u8,
+}
+
+#[repr(C)]
+pub struct DS4RequestNotification {
+	pub Size: u32,
+	pub SerialNo: u32,
+	pub Report: DS4OutputReport,
+}
+
+impl DS4RequestNotification {
+	#[inline]
+	pub fn new(serial_no: u32) -> DS4RequestNotification {
+		DS4RequestNotification {
+			Size: mem::size_of::<DS4RequestNotification>() as u32,
+			SerialNo: serial_no,
+			Report: DS4OutputReport::default(),
+		}
+	}
+}
+
+#[repr(C)]
+pub struct RequestNotification {
 	pub overlapped: OVERLAPPED,
-	pub buffer: T,
+	pub buffer: RequestNotificationVariant,
+}
+
+#[repr(C)]
+pub enum RequestNotificationVariant {
+	#[cfg(feature = "unstable_xtarget_notification")]
+	XUsb(XUsbRequestNotification),
+	DS4(DS4RequestNotification),
 }
 // Safety: This instance must have a stable address (eg. on the heap)
 // Required for non-blocking DeviceIoControl, see msdn.
-#[cfg(feature = "unstable_xtarget_notification")]
-impl<T> RequestNotification<T> {
+impl RequestNotification {
 	#[inline]
-	pub fn new(buffer: T) -> RequestNotification<T> {
+	pub fn new(buffer: RequestNotificationVariant) -> RequestNotification {
 		let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
 		overlapped.hEvent = unsafe { CreateEventW(ptr::null_mut(), 0, 0, ptr::null()) };
 		RequestNotification { overlapped, buffer }
@@ -278,19 +318,38 @@ impl<T> RequestNotification<T> {
 	#[inline]
 	pub unsafe fn ioctl(&mut self, device: HANDLE) {
 		let mut transferred = 0;
-
-		let buffer_ptr = &mut self.buffer as *mut _ as _;
-		let buffer_size = mem::size_of::<T>() as u32;
-
-		DeviceIoControl(
-			device,
-			IOCTL_XUSB_REQUEST_NOTIFICATION,
-			buffer_ptr,
-			buffer_size,
-			buffer_ptr,
-			buffer_size,
-			&mut transferred,
-			&mut self.overlapped);
+		
+		match &mut self.buffer {
+			#[cfg(feature = "unstable_xtarget_notification")]
+			RequestNotificationVariant::XUsb(ref mut buffer) => {
+				let buffer_ptr = buffer as *mut _ as _;
+				let buffer_size = mem::size_of::<XUsbRequestNotification>() as u32;
+				DeviceIoControl(
+					device,
+					IOCTL_XUSB_REQUEST_NOTIFICATION,
+					buffer_ptr,
+					buffer_size,
+					buffer_ptr,
+					buffer_size,
+					&mut transferred,
+					&mut self.overlapped
+				);
+			},
+			RequestNotificationVariant::DS4(ref mut buffer) => {
+				let buffer_ptr = buffer as *mut _ as _;
+				let buffer_size = mem::size_of::<DS4RequestNotification>() as u32;
+				DeviceIoControl(
+					device,
+					IOCTL_DS4_REQUEST_NOTIFICATION,
+					buffer_ptr,
+					buffer_size,
+					buffer_ptr,
+					buffer_size,
+					&mut transferred,
+					&mut self.overlapped
+				);
+			},
+		};
 	}
 	#[inline]
 	pub unsafe fn cancel(&mut self, device: HANDLE) -> Result<(), u32> {
@@ -321,21 +380,18 @@ impl<T> RequestNotification<T> {
 		Ok(())
 	}
 }
-#[cfg(feature = "unstable_xtarget_notification")]
-impl<T> Drop for RequestNotification<T> {
+impl Drop for RequestNotification {
 	fn drop(&mut self) {
 		unsafe { CloseHandle(self.overlapped.hEvent); }
 	}
 }
 
-#[cfg(feature = "unstable_ds4")]
 #[repr(C)]
 pub struct DS4SubmitReport {
 	pub Size: u32,
 	pub SerialNo: u32,
 	pub Report: crate::DS4Report,
 }
-#[cfg(feature = "unstable_ds4")]
 impl DS4SubmitReport {
 	#[inline]
 	pub const fn new(serial_no: u32, report: crate::DS4Report) -> DS4SubmitReport {
@@ -369,52 +425,50 @@ impl DS4SubmitReport {
 	}
 }
 
-#[cfg(feature = "unstable_ds4")]
 #[repr(C, packed)]
 pub struct DS4SubmitReportEx {
-    pub Size: u32,
-    pub SerialNo: u32,
-    pub Report: crate::DS4ReportEx,
+	pub Size: u32,
+	pub SerialNo: u32,
+	pub Report: crate::DS4ReportEx,
 }
-#[cfg(feature = "unstable_ds4")]
 impl DS4SubmitReportEx {
-    #[inline]
-    pub const fn new(serial_no: u32, report: crate::DS4ReportEx) -> DS4SubmitReportEx {
-        DS4SubmitReportEx {
-            Size: mem::size_of::<DS4SubmitReportEx>() as u32,
-            SerialNo: serial_no,
-            Report: report,
-        }
-    }
-    #[inline]
-    pub unsafe fn ioctl(&mut self, device: HANDLE, event: HANDLE) -> Result<(), u32> {
-        let mut transferred = 0;
-        let mut overlapped: OVERLAPPED = mem::zeroed();
-        overlapped.hEvent = event;
+	#[inline]
+	pub const fn new(serial_no: u32, report: crate::DS4ReportEx) -> DS4SubmitReportEx {
+		DS4SubmitReportEx {
+			Size: mem::size_of::<DS4SubmitReportEx>() as u32,
+			SerialNo: serial_no,
+			Report: report,
+		}
+	}
+	#[inline]
+	pub unsafe fn ioctl(&mut self, device: HANDLE, event: HANDLE) -> Result<(), u32> {
+		let mut transferred = 0;
+		let mut overlapped: OVERLAPPED = mem::zeroed();
+		overlapped.hEvent = event;
 
-        DeviceIoControl(
-            device,
-            IOCTL_DS4_SUBMIT_REPORT,
-            self as *mut _ as _,
-            mem::size_of_val(self) as u32,
-            ptr::null_mut(),
-            0,
-            &mut transferred,
-            &mut overlapped,
-        );
+		DeviceIoControl(
+			device,
+			IOCTL_DS4_SUBMIT_REPORT,
+			self as *mut _ as _,
+			mem::size_of_val(self) as u32,
+			ptr::null_mut(),
+			0,
+			&mut transferred,
+			&mut overlapped,
+		);
 
-        if GetOverlappedResult(
-            device,
-            &mut overlapped,
-            &mut transferred,
-            /*bWait: */ 1,
-        ) == 0
-        {
-            return Err(GetLastError());
-        }
+		if GetOverlappedResult(
+			device,
+			&mut overlapped,
+			&mut transferred,
+			/*bWait: */ 1,
+		) == 0
+		{
+			return Err(GetLastError());
+		}
 
-        Ok(())
-    }
+		Ok(())
+	}
 }
 
 
